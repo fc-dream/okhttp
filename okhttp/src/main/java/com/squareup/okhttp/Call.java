@@ -204,6 +204,10 @@ public class Call {
       this.request = request;
     }
 
+    @Override public Connection connection() {
+      return null;
+    }
+
     @Override public Request request() {
       return request;
     }

@@ -260,6 +260,10 @@ public final class HttpEngine {
             requestBodyOut = new RetryableSink();
           }
         } else {
+
+          // NETWORK REQUEST!
+          // THIS IS WHERE WE CALL IN
+
           transport.writeRequestHeaders(request);
           requestBodyOut = transport.createRequestBody(request, contentLength);
         }
@@ -632,7 +636,7 @@ public final class HttpEngine {
     }
 
     // Flush the request body if there's data outstanding.
-    if (bufferedRequestBody != null && bufferedRequestBody.buffer().size() > 0) {
+    if (bufferedRequestBody != null) {
       bufferedRequestBody.flush();
     }
 
@@ -662,6 +666,7 @@ public final class HttpEngine {
 
     transport.flushRequest();
 
+    // NETWORK RESPONSE HEADERS
     networkResponse = transport.readResponseHeaders()
         .request(networkRequest)
         .handshake(connection.getHandshake())

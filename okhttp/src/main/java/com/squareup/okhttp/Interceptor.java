@@ -28,5 +28,7 @@ public interface Interceptor {
   interface Chain {
     Request request();
     Response proceed(Request request) throws IOException;
+
+    Connection connection();
   }
 }

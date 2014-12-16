@@ -20,11 +20,13 @@ import com.squareup.okhttp.mockwebserver.RecordedRequest;
 import com.squareup.okhttp.mockwebserver.rule.MockWebServerRule;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.ForwardingSink;
 import okio.ForwardingSource;
+import okio.GzipSink;
 import okio.Okio;
 import okio.Sink;
 import okio.Source;
@@ -32,7 +34,10 @@ import org.junit.Rule;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.fail;
 
 public final class InterceptorTest {
   @Rule public MockWebServerRule server = new MockWebServerRule();
@@ -40,7 +45,7 @@ public final class InterceptorTest {
   private OkHttpClient client = new OkHttpClient();
   private RecordingCallback callback = new RecordingCallback();
 
-  @Test public void shortCircuitResponseBeforeConnection() throws Exception {
+  @Test public void applicationInterceptorsCanShortCircuitResponses() throws Exception {
     server.get().shutdown(); // Accept no connections.
 
     Request request = new Request.Builder()
@@ -65,10 +70,149 @@ public final class InterceptorTest {
     assertSame(interceptorResponse, response);
   }
 
-  @Test public void rewriteRequestToServer() throws Exception {
+  @Test public void networkInterceptorsCannotShortCircuitResponses() throws Exception {
+    server.get().shutdown(); // Accept no connections.
+
+    Interceptor interceptor = new Interceptor() {
+      @Override public Response intercept(Chain chain) throws IOException {
+        return new Response.Builder()
+            .request(chain.request())
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("Intercepted!")
+            .body(ResponseBody.create(MediaType.parse("text/plain; charset=utf-8"), "abc"))
+            .build();
+      }
+    };
+    client.networkInterceptors().add(interceptor);
+
+    Request request = new Request.Builder()
+        .url("https://localhost:0/")
+        .build();
+
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("network interceptor " + interceptor + " must call proceed() exactly once",
+          expected.getMessage());
+    }
+  }
+
+  @Test public void networkInterceptorsCannotCallProceedMultipleTimes() throws Exception {
+    server.enqueue(new MockResponse());
     server.enqueue(new MockResponse());
 
-    client.interceptors().add(new Interceptor() {
+    Interceptor interceptor = new Interceptor() {
+      @Override public Response intercept(Chain chain) throws IOException {
+        chain.proceed(chain.request());
+        return chain.proceed(chain.request());
+      }
+    };
+    client.networkInterceptors().add(interceptor);
+
+    Request request = new Request.Builder()
+        .url(server.getUrl("/"))
+        .build();
+
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("network interceptor " + interceptor + " must call proceed() exactly once",
+          expected.getMessage());
+    }
+  }
+
+  @Test public void networkInterceptorsCannotChangeServerAddress() throws Exception {
+    server.get().shutdown(); // Accept no connections.
+
+    Interceptor interceptor = new Interceptor() {
+      @Override public Response intercept(Chain chain) throws IOException {
+        return chain.proceed(chain.request().newBuilder()
+            .url("http://localhost:1")
+            .build());
+      }
+    };
+    client.networkInterceptors().add(interceptor);
+
+    Request request = new Request.Builder()
+        .url("https://localhost:0/")
+        .build();
+
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("network interceptor " + interceptor + " must call proceed() exactly once",
+          expected.getMessage());
+    }
+  }
+
+  @Test public void networkInterceptorsHaveConnectionAccess() throws Exception {
+    server.enqueue(new MockResponse());
+
+    client.networkInterceptors().add(new Interceptor() {
+      @Override public Response intercept(Chain chain) throws IOException {
+        Connection connection = chain.connection();
+        assertNotNull(connection);
+        return chain.proceed(chain.request());
+      }
+    });
+
+    Request request = new Request.Builder()
+        .url(server.getUrl("/"))
+        .build();
+    client.newCall(request).execute();
+  }
+
+  @Test public void networkInterceptorsObserveNetworkHeaders() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody(gzip("abcabcabc"))
+        .addHeader("Content-Encoding: gzip"));
+
+    client.networkInterceptors().add(new Interceptor() {
+      @Override public Response intercept(Chain chain) throws IOException {
+        // The network request has everything: User-Agent, Host, Accept-Encoding.
+        Request networkRequest = chain.request();
+        assertNotNull(networkRequest.header("User-Agent"));
+        assertEquals(server.get().getHostName(), networkRequest.header("Host"));
+        assertNotNull(networkRequest.header("Accept-Encoding"));
+
+        // The network response also has everything, including the raw gzipped content.
+        Response networkResponse = chain.proceed(networkRequest);
+        assertEquals("gzip", networkResponse.header("Content-Encoding"));
+        return networkResponse;
+      }
+    });
+
+    Request request = new Request.Builder()
+        .url(server.getUrl("/"))
+        .build();
+
+    // No extra headers in the application's request.
+    assertNull(request.header("User-Agent"));
+    assertNull(request.header("Host"));
+    assertNull(request.header("Accept-Encoding"));
+
+    // No extra headers in the application's response.
+    Response response = client.newCall(request).execute();
+    assertNull(request.header("Content-Encoding"));
+    assertEquals("abcabcabc", response.body().string());
+  }
+
+  @Test public void applicationInterceptorsRewriteRequestToServer() throws Exception {
+    rewriteRequestToServer(client.interceptors());
+  }
+
+  @Test public void networkInterceptorsRewriteRequestToServer() throws Exception {
+    rewriteRequestToServer(client.networkInterceptors());
+  }
+
+  private void rewriteRequestToServer(List<Interceptor> interceptors) throws Exception {
+    server.enqueue(new MockResponse());
+
+    interceptors.add(new Interceptor() {
       @Override public Response intercept(Chain chain) throws IOException {
         Request originalRequest = chain.request();
         return chain.proceed(originalRequest.newBuilder()
@@ -93,12 +237,20 @@ public final class InterceptorTest {
     assertEquals("POST", recordedRequest.getMethod());
   }
 
-  @Test public void rewriteResponseFromServer() throws Exception {
+  @Test public void applicationInterceptorsRewriteResponseFromServer() throws Exception {
+    rewriteResponseFromServer(client.interceptors());
+  }
+
+  @Test public void networkInterceptorsRewriteResponseFromServer() throws Exception {
+    rewriteResponseFromServer(client.networkInterceptors());
+  }
+
+  private void rewriteResponseFromServer(List<Interceptor> interceptors) throws Exception {
     server.enqueue(new MockResponse()
         .addHeader("Original-Header: foo")
         .setBody("abc"));
 
-    client.interceptors().add(new Interceptor() {
+    interceptors.add(new Interceptor() {
       @Override public Response intercept(Chain chain) throws IOException {
         Response originalResponse = chain.proceed(chain.request());
         return originalResponse.newBuilder()
@@ -118,10 +270,18 @@ public final class InterceptorTest {
     assertEquals("foo", response.header("Original-Header"));
   }
 
-  @Test public void multipleInterceptors() throws Exception {
+  @Test public void multipleApplicationInterceptors() throws Exception {
+    multipleInterceptors(client.interceptors());
+  }
+
+  @Test public void multipleNetworkInterceptors() throws Exception {
+    multipleInterceptors(client.networkInterceptors());
+  }
+
+  private void multipleInterceptors(List<Interceptor> interceptors) throws Exception {
     server.enqueue(new MockResponse());
 
-    client.interceptors().add(new Interceptor() {
+    interceptors.add(new Interceptor() {
       @Override public Response intercept(Chain chain) throws IOException {
         Request originalRequest = chain.request();
         Response originalResponse = chain.proceed(originalRequest.newBuilder()
@@ -132,7 +292,7 @@ public final class InterceptorTest {
             .build();
       }
     });
-    client.interceptors().add(new Interceptor() {
+    interceptors.add(new Interceptor() {
       @Override public Response intercept(Chain chain) throws IOException {
         Request originalRequest = chain.request();
         Response originalResponse = chain.proceed(originalRequest.newBuilder()
@@ -157,37 +317,37 @@ public final class InterceptorTest {
         recordedRequest.getHeaders("Request-Interceptor"));
   }
 
-  @Test public void asyncInterceptors() throws Exception {
-    server.get().shutdown(); // Accept no connections.
+  @Test public void asyncApplicationInterceptors() throws Exception {
+    asyncInterceptors(client.interceptors());
+  }
 
-    Request request = new Request.Builder()
-        .url("https://localhost:0/")
-        .build();
+  @Test public void asyncNetworkInterceptors() throws Exception {
+    asyncInterceptors(client.networkInterceptors());
+  }
 
-    final Response interceptorResponse = new Response.Builder()
-        .request(request)
-        .protocol(Protocol.HTTP_1_1)
-        .code(200)
-        .message("Intercepted!")
-        .header("OkHttp-Intercepted", "yep")
-        .body(ResponseBody.create(MediaType.parse("text/plain; charset=utf-8"), "abc"))
-        .build();
+  private void asyncInterceptors(List<Interceptor> interceptors) throws Exception {
+    server.enqueue(new MockResponse());
 
-    client.interceptors().add(new Interceptor() {
+    interceptors.add(new Interceptor() {
       @Override public Response intercept(Chain chain) throws IOException {
-        return interceptorResponse;
+        Response originalResponse = chain.proceed(chain.request());
+        return originalResponse.newBuilder()
+            .addHeader("OkHttp-Intercepted", "yep")
+            .build();
       }
     });
 
+    Request request = new Request.Builder()
+        .url(server.getUrl("/"))
+        .build();
     client.newCall(request).enqueue(callback);
 
     callback.await(request.url())
         .assertCode(200)
-        .assertBody("abc")
         .assertHeader("OkHttp-Intercepted", "yep");
   }
 
-  @Test public void multipleRequestsToServer() throws Exception {
+  @Test public void applicationInterceptorsCanMakeMultipleRequestsToServer() throws Exception {
     server.enqueue(new MockResponse().setBody("a"));
     server.enqueue(new MockResponse().setBody("b"));
 
@@ -245,5 +405,13 @@ public final class InterceptorTest {
         return count;
       }
     };
+  }
+
+  private Buffer gzip(String data) throws IOException {
+    Buffer result = new Buffer();
+    BufferedSink sink = Okio.buffer(new GzipSink(result));
+    sink.writeUtf8(data);
+    sink.close();
+    return result;
   }
 }
